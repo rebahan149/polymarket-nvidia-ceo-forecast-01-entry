@@ -1,111 +1,124 @@
-"""Quantile fan forecasts for the polymarket-nvidia-ceo-forecast-01 task.
+"""Quantile fan forecaster for polymarket-nvidia-ceo-forecast-01.
 
-Each case file holds several markets with a price history. For every
-market this program projects the Yes price over the coming minutes and
-reports five quantiles per minute: 0.05, 0.25, 0.5, 0.75 and 0.95.
+For each market in a case file we emit, for every minute of the horizon,
+five quantiles (0.05, 0.25, 0.5, 0.75, 0.95) of the future Yes price.
 
-Forecast recipe, calibrated against the six practice cases (mean pinball
-loss 0.284, while the flat house reference scores 0.364):
+How the fan is built:
 
-* The centre of the fan is pinned to the most recent observed price:
-  within a few hours these contracts usually stay close to that level.
-* The half-width grows with the horizon raised to 0.4, which is slower
-  than square-root growth; bounded, mean-reverting prices do not fan
-  out like a free random walk.
-* The tail shape is a Student t distribution with five degrees of
-  freedom, wide enough for the sudden jumps these series produce.
-* Volatility is measured market by market, using a robust quartile of
-  the absolute half-hour price changes across the trailing twelve
-  hours, so one news-driven spike in the lookback cannot inflate the
-  whole fan; a market whose series history is too short or completely
-  flat receives a fixed default volatility instead.
-* The volatility ceiling sits higher than a first calibration suggested
-  (0.006, not 0.004): in a field where one market can be repriced by a
-  resignation headline, the wildest series are exactly the ones whose
-  fans the ceiling would otherwise clip too tight. The overall fan is
-  then shrunk a little harder (0.85) to pay for the wider tails.
+* The fan is centred on the last observed price. These contracts tend to
+  hover near their latest level over a few hours, so the freshest print
+  is the best anchor we have.
+* Spread comes from a per-market volatility estimate. Looking back over
+  the trailing 720 prints, we collect the absolute price changes over
+  non-overlapping 30-minute steps and take the upper quartile of those
+  jumps. A quartile is robust: a single news spike inside the lookback
+  window cannot blow up the whole estimate. The quartile is converted
+  to a per-minute sigma by dividing by 1.1503 (its expected multiple of
+  sigma for Gaussian steps) and by sqrt(30). Series shorter than 120
+  points fall back to a default volatility of 0.0025, and a market whose
+  upper quartile never moves is treated as dead flat at 0.0012.
+* The raw sigma is clamped into [0.0012, 0.006] and then multiplied by
+  0.85; that product is the fan's base width. The 0.006 ceiling is
+  deliberately wider than the 0.004 cap a first calibration used: in
+  this event the wildest markets are precisely the ones that get
+  repriced by a headline (a resignation rumour moves a CEO market more
+  than a quiet drift ever will), and capping their volatility too low
+  left their fans far too narrow. The cost of the wider tails is paid
+  by shrinking every fan a bit harder, hence 0.85 rather than 0.9.
+* Width grows with the horizon as h**0.4, slower than the square-root
+  law of a free random walk, because a probability bounded in [0, 1]
+  mean-reverts instead of wandering off. The five quantile offsets are
+  the critical values of Student's t distribution with five degrees of
+  freedom, which gives the fan heavier tails than a Gaussian of the
+  same width. Every quantile is clamped into [0, 1] and rounded to six
+  decimal places.
 
-Only the Python standard library is used and the output is fully
-deterministic. Input cases are read from the directory named by the
-environment variable MAKEFUN_INPUT_DIR (falling back to /input) and one
-result file per case is written to MAKEFUN_OUTPUT_DIR (or /output).
+Calibration: on the six practice cases this recipe scores a mean
+pinball loss of about 0.284, against 0.364 for the flat house
+reference forecast.
+
+The program uses only the standard library, touches no network, and is
+fully deterministic. Cases are read from the directory named by
+MAKEFUN_INPUT_DIR (default /input); one output file per case is
+written to MAKEFUN_OUTPUT_DIR (default /output).
 """
 
-import json, math, os
+import json
+import math
+import os
 from pathlib import Path
 
-# Critical values of the t distribution with five degrees of
-# freedom, taken at the five quantile levels this task asks for, in order.
-T_CRITICALS = (-2.015048, -0.726687, 0.0, 0.726687, 2.015048)
+# Student-t (df = 5) critical values at the five requested quantiles.
+T_CRITS = (-2.015048, -0.726687, 0.0, 0.726687, 2.015048)
 
-SHORT_HISTORY_VOL = 0.0025  # fallback volatility for series under 120 points
-FLAT_MARKET_VOL = 0.0012    # floor volatility for a series that never moved
-VOL_FLOOR = 0.0012
-VOL_CEILING = 0.006
-FAN_SHRINK = 0.85           # empirical calibration factor for the fan width
-GROWTH_POWER = 0.4          # sub-diffusive growth of the fan with horizon
-HISTORY_SPAN = 720          # minutes of trailing history used for volatility
-JUMP_LAG = 30               # lag, in minutes, between compared price points
-QUARTILE_DIVISOR = 1.1503   # scales the upper quartile of moves to a sigma
+LOOKBACK = 720          # prints of history feeding the volatility estimate
+MIN_POINTS = 120        # below this the fallback volatility is used
+FALLBACK_VOL = 0.0025   # volatility for too-short series
+FLAT_VOL = 0.0012       # volatility for a series whose quartile never moves
+STEP = 30               # minutes between the endpoints of each measured jump
+QUARTILE_SCALE = 1.1503  # upper-quartile-to-sigma factor for a 30-min step
+VOL_MIN = 0.0012
+VOL_MAX = 0.006
+SHRINK = 0.85           # global narrowing applied after the clamp
+GROWTH = 0.4            # horizon exponent of the fan width (sub-diffusive:
+                        # the fan widens more slowly than sqrt(h) would)
 
 
-def per_market_vol(series):
-    """Robust per-minute volatility implied by a price history."""
-    window = series[-HISTORY_SPAN:]
-    if len(window) < 120:
-        return SHORT_HISTORY_VOL
-    jumps = []
-    for start in range(JUMP_LAG, len(window), JUMP_LAG):
-        jumps.append(abs(window[start] - window[start - JUMP_LAG]))
+def estimate_vol(prices):
+    """Per-minute volatility implied by the tail of the price history."""
+    window = prices[-LOOKBACK:]
+    if len(window) < MIN_POINTS:
+        return FALLBACK_VOL
+    jumps = [abs(window[i] - window[i - STEP])
+             for i in range(STEP, len(window), STEP)]
+    if not jumps:
+        return FLAT_VOL
     jumps.sort()
-    if len(jumps) == 0:
-        return SHORT_HISTORY_VOL
     upper = jumps[(3 * (len(jumps) - 1)) // 4]
-    if not upper > 0.0:
-        return FLAT_MARKET_VOL
-    return upper / QUARTILE_DIVISOR / math.sqrt(JUMP_LAG)
+    if upper == 0:
+        return FLAT_VOL
+    return upper / QUARTILE_SCALE / math.sqrt(STEP)
 
 
-def clamp_price(value):
-    """Keep a probability forecast inside its feasible interval."""
-    return min(1.0, max(0.0, value))
-
-
-def build_row(anchor, width):
-    """One row of the fan: the anchor shifted by each critical value."""
-    return [round(clamp_price(anchor + crit * width), 6) for crit in T_CRITICALS]
-
-
-def project_market(series, minutes):
-    """Project one market: a fan of quantile rows, one per minute."""
+def fan_for_market(prices, horizon):
+    """Build the horizon x 5 quantile table for one market."""
+    series = prices if prices else [0.5]
     anchor = series[-1]
-    vol = per_market_vol(series)
-    width_base = min(VOL_CEILING, max(VOL_FLOOR, vol)) * FAN_SHRINK
+    vol = min(VOL_MAX, max(VOL_MIN, estimate_vol(series)))
+    base_width = vol * SHRINK
     table = []
-    for step in range(1, minutes + 1):
-        table.append(build_row(anchor, width_base * (step ** GROWTH_POWER)))
+    for h in range(1, horizon + 1):
+        width = base_width * h ** GROWTH
+        row = [round(min(1.0, max(0.0, anchor + c * width)), 6)
+               for c in T_CRITS]
+        table.append(row)
     return table
 
 
-def solve_case(payload):
-    """Build the result document for one parsed case file."""
-    horizon = int(payload.get("horizon_minutes", 240))
+def forecast_case(case):
+    """Turn one parsed case document into its forecast document."""
+    horizon = int(case.get("horizon_minutes", 240))
     forecasts = []
-    for entry in payload["markets"]:
-        history = entry["prices"] if entry["prices"] else [0.5]
-        forecasts.append({"id": entry["id"], "q": project_market(history, horizon)})
+    for market in case["markets"]:
+        forecasts.append({
+            "id": market["id"],
+            "q": fan_for_market(market["prices"], horizon),
+        })
     return {"forecasts": forecasts}
 
 
 def main():
-    source_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-    target_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-    target_dir.mkdir(parents=True, exist_ok=True)
-    for case_path in sorted(source_dir.glob("*.in")):
-        payload = json.loads(case_path.read_text(encoding="utf-8"))
-        result_path = target_dir.joinpath(case_path.stem + ".out")
-        result_path.write_text(json.dumps(solve_case(payload)), encoding="utf-8")
+    in_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
+    out_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for case_file in sorted(in_dir.glob("*.in")):
+        with open(case_file, encoding="utf-8") as fh:
+            case = json.load(fh)
+        result = forecast_case(case)
+        out_path = out_dir / (case_file.stem + ".out")
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump(result, fh)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
