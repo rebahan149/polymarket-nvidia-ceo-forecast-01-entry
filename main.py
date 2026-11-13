@@ -5,7 +5,7 @@ market this program projects the Yes price over the coming minutes and
 reports five quantiles per minute: 0.05, 0.25, 0.5, 0.75 and 0.95.
 
 Forecast recipe, calibrated against the six practice cases (mean pinball
-loss 0.289, while the flat house reference scores 0.364):
+loss 0.284, while the flat house reference scores 0.364):
 
 * The centre of the fan is pinned to the most recent observed price:
   within a few hours these contracts usually stay close to that level.
@@ -19,6 +19,11 @@ loss 0.289, while the flat house reference scores 0.364):
   hours, so one news-driven spike in the lookback cannot inflate the
   whole fan; a market whose series history is too short or completely
   flat receives a fixed default volatility instead.
+* The volatility ceiling sits higher than a first calibration suggested
+  (0.006, not 0.004): in a field where one market can be repriced by a
+  resignation headline, the wildest series are exactly the ones whose
+  fans the ceiling would otherwise clip too tight. The overall fan is
+  then shrunk a little harder (0.85) to pay for the wider tails.
 
 Only the Python standard library is used and the output is fully
 deterministic. Input cases are read from the directory named by the
@@ -36,8 +41,8 @@ T_CRITICALS = (-2.015048, -0.726687, 0.0, 0.726687, 2.015048)
 SHORT_HISTORY_VOL = 0.0025  # fallback volatility for series under 120 points
 FLAT_MARKET_VOL = 0.0012    # floor volatility for a series that never moved
 VOL_FLOOR = 0.0012
-VOL_CEILING = 0.004
-FAN_SHRINK = 0.9            # empirical calibration factor for the fan width
+VOL_CEILING = 0.006
+FAN_SHRINK = 0.85           # empirical calibration factor for the fan width
 GROWTH_POWER = 0.4          # sub-diffusive growth of the fan with horizon
 HISTORY_SPAN = 720          # minutes of trailing history used for volatility
 JUMP_LAG = 30               # lag, in minutes, between compared price points
