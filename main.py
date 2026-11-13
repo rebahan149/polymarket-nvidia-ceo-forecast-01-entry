@@ -1,81 +1,106 @@
-"""polymarket-nvidia-ceo-forecast-01 entry: minute-by-minute quantile forecasts.
+"""Quantile fan forecasts for the polymarket-nvidia-ceo-forecast-01 task.
 
-For every market in a case file, forecast the Yes price at each of the next
-240 minutes as five quantiles (0.05, 0.25, 0.5, 0.75, 0.95).
+Each case file holds several markets with a price history. For every
+market this program projects the Yes price over the coming minutes and
+reports five quantiles per minute: 0.05, 0.25, 0.5, 0.75 and 0.95.
 
-Model, tuned on the six practice cases (pinball loss 0.289 vs the house
-baseline's 0.364): the median stays at the checkpoint price; the spread is a
-Student-t (df=5) fan whose per-market sigma is estimated robustly from the
-75th percentile of absolute 30-minute moves over the last 12 hours, so a
-single news spike in the lookback does not blow the fan wide open. The fan
-widens like h**0.4 (slower than a random walk: these are bounded,
-mean-reverting prices) and is clamped to [0, 1] like the prices themselves.
+Forecast recipe, calibrated against the six practice cases (mean pinball
+loss 0.289, while the flat house reference scores 0.364):
 
-Python 3.13, standard library only, deterministic.
-Reads $MAKEFUN_INPUT_DIR (default /input), writes $MAKEFUN_OUTPUT_DIR
-(default /output).
+* The centre of the fan is pinned to the most recent observed price:
+  within a few hours these contracts usually stay close to that level.
+* The half-width grows with the horizon raised to 0.4, which is slower
+  than square-root growth; bounded, mean-reverting prices do not fan
+  out like a free random walk.
+* The tail shape is a Student t distribution with five degrees of
+  freedom, wide enough for the sudden jumps these series produce.
+* Volatility is measured market by market, using a robust quartile of
+  the absolute half-hour price changes across the trailing twelve
+  hours, so one news-driven spike in the lookback cannot inflate the
+  whole fan; a market whose series history is too short or completely
+  flat receives a fixed default volatility instead.
+
+Only the Python standard library is used and the output is fully
+deterministic. Input cases are read from the directory named by the
+environment variable MAKEFUN_INPUT_DIR (falling back to /input) and one
+result file per case is written to MAKEFUN_OUTPUT_DIR (or /output).
 """
 
-import json
-import math
-import os
+import json, math, os
 from pathlib import Path
 
-Z = [-2.015048, -0.726687, 0.0, 0.726687, 2.015048]  # Student-t df=5 quantiles
-FALLBACK_SIGMA = 0.0025  # the house baseline's global sigma
-ZERO_SIGMA = 0.0012      # a market that did not move still gets a narrow fan
-SIGMA_LO = 0.0012
-SIGMA_HI = 0.004
-SCALE = 0.9
-BETA = 0.4
-LOOKBACK = 720   # minutes of history used for the vol estimate (12 h)
-STEP = 30        # move horizon (minutes) the vol is measured on
+# Critical values of the t distribution with five degrees of
+# freedom, taken at the five quantile levels this task asks for, in order.
+T_CRITICALS = (-2.015048, -0.726687, 0.0, 0.726687, 2.015048)
+
+SHORT_HISTORY_VOL = 0.0025  # fallback volatility for series under 120 points
+FLAT_MARKET_VOL = 0.0012    # floor volatility for a series that never moved
+VOL_FLOOR = 0.0012
+VOL_CEILING = 0.004
+FAN_SHRINK = 0.9            # empirical calibration factor for the fan width
+GROWTH_POWER = 0.4          # sub-diffusive growth of the fan with horizon
+HISTORY_SPAN = 720          # minutes of trailing history used for volatility
+JUMP_LAG = 30               # lag, in minutes, between compared price points
+QUARTILE_DIVISOR = 1.1503   # scales the upper quartile of moves to a sigma
 
 
-def sigma_of(prices: list[float]) -> float:
-    """Per-sqrt-minute vol from the 75th percentile of |30-min moves|."""
-    p = prices[-LOOKBACK:]
-    if len(p) < 120:
-        return FALLBACK_SIGMA
-    moves = sorted(abs(p[i] - p[i - STEP]) for i in range(STEP, len(p), STEP))
-    if not moves:
-        return FALLBACK_SIGMA
-    q75 = moves[int(0.75 * (len(moves) - 1))]
-    if q75 <= 0:
-        return ZERO_SIGMA
-    return q75 / 1.1503 / math.sqrt(STEP)
+def per_market_vol(series):
+    """Robust per-minute volatility implied by a price history."""
+    window = series[-HISTORY_SPAN:]
+    if len(window) < 120:
+        return SHORT_HISTORY_VOL
+    jumps = []
+    for start in range(JUMP_LAG, len(window), JUMP_LAG):
+        jumps.append(abs(window[start] - window[start - JUMP_LAG]))
+    jumps.sort()
+    if len(jumps) == 0:
+        return SHORT_HISTORY_VOL
+    upper = jumps[(3 * (len(jumps) - 1)) // 4]
+    if not upper > 0.0:
+        return FLAT_MARKET_VOL
+    return upper / QUARTILE_DIVISOR / math.sqrt(JUMP_LAG)
 
 
-def forecast_market(prices: list[float], horizon: int) -> list[list[float]]:
-    x = prices[-1]
-    s = min(SIGMA_HI, max(SIGMA_LO, sigma_of(prices))) * SCALE
-    rows = []
-    for h in range(1, horizon + 1):
-        w = s * (h ** BETA)
-        rows.append([round(min(1.0, max(0.0, x + z * w)), 6) for z in Z])
-    return rows
+def clamp_price(value):
+    """Keep a probability forecast inside its feasible interval."""
+    return min(1.0, max(0.0, value))
 
 
-def run_case(case: dict) -> dict:
-    horizon = int(case.get("horizon_minutes", 240))
-    return {
-        "forecasts": [
-            {"id": m["id"], "q": forecast_market(m["prices"] or [0.5], horizon)}
-            for m in case["markets"]
-        ]
-    }
+def build_row(anchor, width):
+    """One row of the fan: the anchor shifted by each critical value."""
+    return [round(clamp_price(anchor + crit * width), 6) for crit in T_CRITICALS]
 
 
-def main() -> None:
-    in_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-    out_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for path in sorted(in_dir.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        result = run_case(case)
-        out_path = out_dir / (path.stem + ".out")
-        out_path.write_text(json.dumps(result), encoding="utf-8")
+def project_market(series, minutes):
+    """Project one market: a fan of quantile rows, one per minute."""
+    anchor = series[-1]
+    vol = per_market_vol(series)
+    width_base = min(VOL_CEILING, max(VOL_FLOOR, vol)) * FAN_SHRINK
+    table = []
+    for step in range(1, minutes + 1):
+        table.append(build_row(anchor, width_base * (step ** GROWTH_POWER)))
+    return table
+
+
+def solve_case(payload):
+    """Build the result document for one parsed case file."""
+    horizon = int(payload.get("horizon_minutes", 240))
+    forecasts = []
+    for entry in payload["markets"]:
+        history = entry["prices"] if entry["prices"] else [0.5]
+        forecasts.append({"id": entry["id"], "q": project_market(history, horizon)})
+    return {"forecasts": forecasts}
+
+
+def main():
+    source_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
+    target_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for case_path in sorted(source_dir.glob("*.in")):
+        payload = json.loads(case_path.read_text(encoding="utf-8"))
+        result_path = target_dir.joinpath(case_path.stem + ".out")
+        result_path.write_text(json.dumps(solve_case(payload)), encoding="utf-8")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
